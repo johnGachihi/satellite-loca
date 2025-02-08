@@ -214,4 +214,20 @@ class ToTokenSequence(nn.Module):
         Returns:
             Tuple of (processed tokens, indices of kept tokens)
         """
-        
+
+        # Patch embed then convert from NCHW to NHWC
+        x = self.embedding(x).permute(0, 2, 3, 1)
+
+        # Add positional encodings
+        x = self.add_positional_encodings(x, positional_embedding)
+
+        # Possibly drop some tokens
+        idx_kept_tokens = None
+        n_tokens = self.posembs[0] * self.posembs[1]
+        if seqlen > 0:
+            idx_kept_tokens = self.token_indexes_not_to_drop(
+                seqlen, n_tokens, seqlen_selection)
+            if len(idx_kept_tokens) < n_tokens:
+                x = torch.index_select(x, 1, idx_kept_tokens)
+
+        return x, idx_kept_tokens
