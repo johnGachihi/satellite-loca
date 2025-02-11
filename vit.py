@@ -1,6 +1,13 @@
+import math
+import string
+from typing import Tuple, Optional
+
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import ml_collections
 from timm.models.vision_transformer import Block
+
 
 def get_fixed_sincos_position_embedding(x_shape: Tuple[int, ...],
                                         temperature: float = 10_000,
@@ -16,14 +23,15 @@ def get_fixed_sincos_position_embedding(x_shape: Tuple[int, ...],
     x_shape: the shape of the input for which a position embedding is needed.
     temperature: Temperature parameter.
     dtype: dtype of the position encoding.
+    device:
   Returns:
     Matrix of position embeddings, has shape [1, ...], where ... = x_shape[1:].
   """
 
     assert len(x_shape) in (4, 5), f'Unsupported input shape: {x_shape}'
-    num_parts = 4 if(len(x_shape)) == 4 else 6
+    num_parts = 4 if (len(x_shape)) == 4 else 6
     channels = x_shape[-1]
-    assert channels % num_parts == 0, f'channels must be multiple of num_parts' # I don't get this
+    assert channels % num_parts == 0, f'channels must be multiple of num_parts'  # I don't get this
 
     dim_t = channels // num_parts
     omega = torch.arange(dim_t, dtype=torch.float32, device=device)
@@ -50,9 +58,9 @@ def get_fixed_sincos_position_embedding(x_shape: Tuple[int, ...],
         shape = (1, h, w, channels)
     else:
         """Not checked since won't be used"""
-        
+
         _, t, h, w, _ = x_shape
-        
+
         # Create 3D coordinate grids
         z, y, x = torch.meshgrid(
             torch.arange(t, device=device),
@@ -60,12 +68,12 @@ def get_fixed_sincos_position_embedding(x_shape: Tuple[int, ...],
             torch.arange(w, device=device),
             indexing='ij'
         )
-        
+
         # Calculate position encodings for each dimension
         z_enc = torch.einsum('m,d->md', z.flatten(), omega)
         y_enc = torch.einsum('m,d->md', y.flatten(), omega)
         x_enc = torch.einsum('m,d->md', x.flatten(), omega)
-        
+
         # Generate sin/cos patterns for all dimensions
         pos_emb = [
             torch.sin(z_enc), torch.cos(z_enc),
@@ -76,8 +84,24 @@ def get_fixed_sincos_position_embedding(x_shape: Tuple[int, ...],
 
     pe = torch.cat(pos_emb, dim=1)
     pe = pe.reshape(*shape)
-    
+
     return pe.to(dtype)
+
+
+def token_indexes_not_to_drop(seqlen: int, n_tokens: int, seqlen_selection: str, device: torch.device = None):
+    idx_kept_tokens = torch.arange(n_tokens, device=device)
+
+    if 0 < seqlen <= n_tokens:
+        if seqlen_selection in ["first", "consequtive"]:
+            if seqlen_selection == "first":
+                offset = 0
+            else:
+                offset = torch.randint(0, n_tokens - seqlen + 1, (1,), device=device).item()
+            idx_kept_tokens = torch.ones(seqlen) * offset + torch.arange(seqlen)
+        elif seqlen_selection == "unstructured":
+            idx_kept_tokens = torch.randperm(n_tokens, device=device)[:seqlen]
+
+    return idx_kept_tokens.long()
 
 
 class AddFixedSinCosPositionEmbedding(nn.Module):
@@ -91,8 +115,9 @@ class AddFixedSinCosPositionEmbedding(nn.Module):
         temperature: Controls the frequency bands of position encodings
         dtype: Desired dtype for the position encodings
     """
+
     def __init__(self, temperature: float = 10_000, dtype: torch.dtype = torch.float32):
-        super().init()
+        super().__init__()
         self.temperature = temperature
         self.dtype = dtype
 
@@ -128,28 +153,32 @@ class ToTokenSequence(nn.Module):
         posembs: Size of the positional embedding grid (height, width)
         positional_embedding: Type of positional embedding ('learned' or 'sinusoidal_2d')
     """
-    def __init__(self,
-                 patches: ml_collections.ConfigDict,
-                 hidden_size: int,
-                 posembs: Tuple[int, int] = (14, 14)
-                 positional_embedding: str = "learned"):
-        super().init()
+
+    def __init__(
+            self,
+            patches: ml_collections.ConfigDict,
+            hidden_size: int,
+            posembs: Tuple[int, int] = (14, 14),
+            positional_embedding: str = "learned"
+    ):
+        super().__init__()
+
         self.patches = patches
         self.hidden_size = hidden_size
         self.posembs = posembs
-        self.positional_embeddings = positional_embeddings
+        self.positional_embeddings = positional_embedding
 
-        self.embedding = nn.Conv2D(
-            in_channels = 3  # TODO: Revisit
-            out_channels=hidden_size,
+        self.embedding = nn.Conv2d(
+            in_channels=3,  # TODO: Revisit
+            out_channels=self.hidden_size,
             kernel_size=patches.size,  # Using size from ConfigDict
             stride=patches.size,  # Same stride as kernel for non-overlapping patches
-            padding=0 
+            padding=0
         )
 
         if positional_embedding == "learned":
             std = 1.0 / math.sqrt(hidden_size)
-            self.pos_embed = nn.Parameters(
+            self.pos_embed = nn.Parameter(
                 torch.randn(1, posembs[0], posembs[1], hidden_size) * std
             )
         elif positional_embedding == "sinusoidal_2d":
@@ -179,26 +208,10 @@ class ToTokenSequence(nn.Module):
         x = x.reshape(-1, h * w, c)
         return x
 
-    def token_indexes_not_to_drop(self, seqlen: int, n_tokens: int, seqlen_selection: str):
-        device = self.embedding.weight.device
-        idx_kept_tokens = torch.arange(n_tokens, device=device)
-
-        if seqlen > 0 and seqlen <= n_tokens:
-            if seqlen_selection in ["first", "consequtive"]:
-                if seqlen_selection == "first":
-                    offset = 0
-                else:
-                    offset = torch.randint(0, n_tokens - seqlen + 1, (1,), device=device).item()
-                    idx_kept_tokens = torch.ones(seqlen) * offset + torch.arange(seqlen)
-            elif seqlen_selection == "unstructured":
-                idx_kept_tokens = torch.randperm(n_tokens, device=device)[:seqlen]
-                
-        return idx_kept_tokens.long()
-
     def forward(
-            self, x: torch.Tensor, positiona_embedding: str = '',
+            self, x: torch.Tensor, positional_embedding: str = '',
             seqlen: int = -1, seqlen_selection: str = "unstructured"
-    ) -> Tuple[torch.Tensor], Optional[torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Process input images into sequences of patch tokens.
         
         This method handles the complete pipeline of:
@@ -226,8 +239,8 @@ class ToTokenSequence(nn.Module):
         idx_kept_tokens = None
         n_tokens = self.posembs[0] * self.posembs[1]
         if seqlen > 0:
-            idx_kept_tokens = self.token_indexes_not_to_drop(
-                seqlen, n_tokens, seqlen_selection)
+            idx_kept_tokens = token_indexes_not_to_drop(
+                seqlen, n_tokens, seqlen_selection, device=self.embedding.weight.device)
             if len(idx_kept_tokens) < n_tokens:
                 x = torch.index_select(x, 1, idx_kept_tokens)
 
@@ -254,22 +267,23 @@ class ViT4LOCA(nn.Module):
     posembs: Positional embedding size.
     dtype: JAX data type for activations.
     """
+
     def __init__(
-        self,
-        num_layers: int,
-        num_heads: int,
-        patches: ml_collections.ConfigDict,
-        hidden_size: int,
-        n_ref_positions: int,
-        apply_cluster_loss: bool,
-        head_hidden_dim: int,
-        head_bottleneck_dim: int,
-        head_output_dim: int,
-        mlp_ratio: int = 4,
-        dropout_rate: float = 0.0,
-        attention_dropout_rate: float = 0.0,
-        stochastic_depth: float = 0.1,
-        posembs: Tuple[int, int] = (14, 14)
+            self,
+            num_layers: int,
+            num_heads: int,
+            patches: ml_collections.ConfigDict,
+            hidden_size: int,
+            n_ref_positions: int,
+            apply_cluster_loss: bool,
+            head_hidden_dim: int,
+            head_bottleneck_dim: int,
+            head_output_dim: int,
+            mlp_ratio: int = 4,
+            dropout_rate: float = 0.0,
+            attention_dropout_rate: float = 0.0,
+            stochastic_depth: float = 0.1,
+            posembs: Tuple[int, int] = (14, 14)
     ):
         super().__init__()
         # Store configuration
@@ -290,11 +304,10 @@ class ViT4LOCA(nn.Module):
         )
 
         # ViT Encoder
-        self.encoder_block = Block([
+        self.encoder_block = nn.ModuleList([
             Block(
-                dim=hidden_size, num_heads=num_heads,
-                mlp_ratio=mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
-                drop_path=stochastic_depth * (i / max(num_layers - 1, 1))
+                dim=hidden_size, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, drop_path=stochastic_depth * (i / max(num_layers - 1, 1))
             )
             for i in range(num_layers)
         ])
@@ -311,7 +324,7 @@ class ViT4LOCA(nn.Module):
         # Cross-attention component
         self.cross_attention = CrossAttentionEncoderBlock(
             dim=hidden_size,
-            mlp_dim=mlp_dim,
+            mlp_dim=hidden_size * mlp_ratio,
             num_heads=num_heads,
             dropout_rate=dropout_rate,
             attention_dropout_rate=attention_dropout_rate,
@@ -323,15 +336,15 @@ class ViT4LOCA(nn.Module):
         self.position_predictor = nn.Linear(hidden_size, n_ref_positions)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        inputs_kv: Optional[torch.Tensor] = None,
-        train: bool = True,
-        seqlen: int = -1,
-        use_pe: bool = True,
-        drop_moment: str = 'early',
-        seqlen_selection: str = 'unstructured',
-        debug: bool = False
+            self,
+            x: torch.Tensor,
+            inputs_kv: Optional[torch.Tensor] = None,
+            train: bool = True,
+            seqlen: int = -1,
+            use_pe: bool = True,
+            drop_moment: str = 'early',
+            seqlen_selection: str = 'unstructured',
+            debug: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
         """Process input images through the LOCA transformer architecture.
         
@@ -349,37 +362,38 @@ class ViT4LOCA(nn.Module):
             seqlen=seqlen if drop_moment == 'early' else -1,
             seqlen_selection=seqlen_selection
         )
-        
+
         # Process through transformer encoder blocks
         for encoder in self.encoder_blocks:
             x = encoder(x, train)
         x = self.encoder_norm(x)
-        
+
         # Generate clustering predictions if requested
         cluster_pred_outputs = None
         if self.apply_cluster_loss:  # TODO. Interesting! What's happening here?
             cluster_pred_outputs = self.projection_head(x, train)
-            cluster_pred_outputs = cluster_pred_outputs.reshape(-1, 
-                                                             self.head_output_dim)
-        
+            cluster_pred_outputs = cluster_pred_outputs.reshape(-1,
+                                                                self.head_output_dim)
+
         # Store patch representations before potential token dropping
         patches_repr = x
-        
+
         # Handle late token dropping if requested
         if drop_moment == 'late':
             idx_kept_tokens = token_indexes_not_to_drop(
-                seqlen, self.n_ref_positions, seqlen_selection)
+                seqlen, self.n_ref_positions, seqlen_selection,
+                device=self.embedding.weight.device)
             if len(idx_kept_tokens) < self.n_ref_positions:
                 patches_repr = torch.index_select(patches_repr, 1, idx_kept_tokens)
-        
+
         # Apply cross-attention between query and reference patches
         if inputs_kv is None:
             inputs_kv = patches_repr.clone()
-        
+
         x = self.cross_attention(x, inputs_kv=inputs_kv, train=train)
         x = self.final_norm(x)
         x = self.position_predictor(x)
-        
+
         return x, cluster_pred_outputs, patches_repr, idx_kept_tokens
 
 
@@ -394,15 +408,16 @@ class ProjectionHead(nn.Module):
     use_bn: Use batch normalizations.
     n_layers: Depth of the projection head.
     """
+
     def __init__(
-        self,
-        hidden_dim: int = 2048,
-        bottleneck_dim: int = 256,
-        output_dim: int = 4096,
-        n_layers: int = 2
+            self,
+            hidden_dim: int = 2048,
+            bottleneck_dim: int = 256,
+            output_dim: int = 4096,
+            n_layers: int = 2
     ):
         super().__init__()
-        
+
         # Create MLP layers
         self.mlp_layers = nn.ModuleList([
             nn.Sequential(
@@ -410,10 +425,10 @@ class ProjectionHead(nn.Module):
                 nn.GELU()
             ) for _ in range(n_layers)
         ])
-        
+
         # Bottleneck layer
         self.bottleneck = nn.Linear(hidden_dim, bottleneck_dim)
-        
+
         # Output layer with weight normalization
         self.prototypes = WeightNormLinear(bottleneck_dim, output_dim, bias=False)
 
@@ -430,19 +445,18 @@ class ProjectionHead(nn.Module):
         # Apply MLP layers with residual connections
         for layer in self.mlp_layers:
             x = x + layer(x)  # Residual connection around GELU
-            
+
         # Bottleneck
         x = self.bottleneck(x)
 
         # TODO: Interesting! Why normalize?
         # L2 normalize features
         x = F.normalize(x, p=2, dim=-1)
-        
+
         # Project to prototypes with weight normalization
         x = self.prototypes(x)
-        
+
         return x
-        
 
 
 class WeightNormLinear(nn.Linear):
@@ -455,7 +469,7 @@ class WeightNormLinear(nn.Linear):
         # Then normalize the kernel
         with torch.no_grad():
             self.weight.div_(torch.norm(self.weight, dim=0, keepdim=True) + 1e-10)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with normalized weights."""
         # Normalize the weight matrix
@@ -466,20 +480,21 @@ class WeightNormLinear(nn.Linear):
 
 class CrossAttentionEncoderBlock(nn.Module):
     """Transformer layer with cross-attention."""
+
     def __init__(
-        self,
-        dim: int,
-        mlp_dim: int,
-        num_heads: int,
-        dropout_rate: float = 0.0,
-        attention_dropout_rate: float = 0.0,
-        stochastic_depth: float = 0.0
+            self,
+            dim: int,
+            mlp_dim: int,
+            num_heads: int,
+            dropout_rate: float = 0.0,
+            attention_dropout_rate: float = 0.0,
+            stochastic_depth: float = 0.0
     ):
         super().__init__()
         # Normalization layers
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
-        
+
         # Multi-head attention (using PyTorch's implementation)
         self.attn = nn.MultiheadAttention(
             embed_dim=dim,
@@ -487,31 +502,31 @@ class CrossAttentionEncoderBlock(nn.Module):
             dropout=attention_dropout_rate,
             batch_first=True
         )
-        
+
         # MLP block
         self.mlp = MlpBlock(
             dim=dim,
             mlp_dim=mlp_dim,
             dropout_rate=dropout_rate
         )
-        
+
         # Dropout and StochasticDepth
         self.dropout = nn.Dropout(dropout_rate)
         self.drop_path = StochasticDepth(stochastic_depth)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        inputs_kv: torch.Tensor,
-        train: bool = True
+            self,
+            x: torch.Tensor,
+            inputs_kv: torch.Tensor,
+            train: bool = True
     ) -> torch.Tensor:
         # Attention block
         assert x.ndim == 3, f"Expected 3D tensor, got {x.ndim}D"
-        
+
         # Normalize inputs
         q = self.norm1(x)
         kv = self.norm1(inputs_kv)
-        
+
         # Apply attention
         attn_out, _ = self.attn(
             query=q,
@@ -519,34 +534,35 @@ class CrossAttentionEncoderBlock(nn.Module):
             value=kv,
             need_weights=False
         )
-        
+
         # Apply dropout and stochastic depth
         attn_out = self.dropout(attn_out) if train else attn_out
         x = x + self.drop_path(attn_out, train)
-        
+
         # MLP block
         y = self.mlp(self.norm2(x), train)
         y = self.drop_path(y, train)
         x = x + y
-        
+
         return x
 
 
 class MlpBlock(nn.Module):
     """Transformer MLP block."""
+
     def __init__(
-        self,
-        dim: int,
-        mlp_dim: int,
-        dropout_rate: float = 0.1,
-        use_bias: bool = True
+            self,
+            dim: int,
+            mlp_dim: int,
+            dropout_rate: float = 0.1,
+            use_bias: bool = True
     ):
         super().__init__()
         self.fc1 = nn.Linear(dim, mlp_dim, bias=use_bias)
         self.fc2 = nn.Linear(mlp_dim, dim, bias=use_bias)
         self.dropout = nn.Dropout(dropout_rate)
         self.act = nn.GELU()
-        
+
         # Initialize weights
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
@@ -562,8 +578,10 @@ class MlpBlock(nn.Module):
         x = self.dropout(x) if train else x
         return x
 
+
 class StochasticDepth(nn.Module):
     """Implements stochastic depth for regularization."""
+
     def __init__(self, drop_rate: float = 0.0):
         super().__init__()
         self.drop_rate = drop_rate
@@ -571,9 +589,27 @@ class StochasticDepth(nn.Module):
     def forward(self, x: torch.Tensor, train: bool = True) -> torch.Tensor:
         if not train or self.drop_rate == 0.0:
             return x
-            
+
         keep_rate = 1.0 - self.drop_rate
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device) < keep_rate
         return x.div(keep_rate) * random_tensor
 
+
+def create_ViTLOCAModel(config: ml_collections.ConfigDict):
+    return ViT4LOCA(
+        num_layers=config.model.num_layers,
+        num_heads=config.model.num_heads,
+        patches=config.model.patches,
+        hidden_size=config.model.hidden_size,
+        n_ref_positions=config.n_ref_positions,
+        apply_cluster_loss=config.apply_cluster_loss,
+        head_hidden_dim=config.model.get('head_hidden_dim', 2048),
+        head_bottleneck_dim=config.model.get('head_bottleneck_dim', 256),
+        head_output_dim=config.model.get('head_output_dim', 1024),
+        mlp_ratio=config.model.mlp_ratio,
+        dropout_rate=config.model.dropout_rate,
+        attention_dropout_rate=config.model.attention_dropout_rate,
+        stochastic_depth=config.model.stochastic_depth,
+        posembs=config.model.get('posembs', (14, 14))
+    )

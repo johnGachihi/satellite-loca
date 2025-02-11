@@ -1,7 +1,15 @@
+from pathlib import Path
+
+import ml_collections
+from typing import Any, Tuple
+import torch
+import torch.nn as nn
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from engine_pretrain import train_epoch
 from config import get_config
-from vit import ViTLOCAModel
+from vit import create_ViTLOCAModel
+import copy
 
 def train(
         *,
@@ -82,8 +90,10 @@ def train(
 if __name__ == '__main__':
     config = get_config()
 
-    model = ViTL
+    model = create_ViTLOCAModel(config)
+    dataset = LOCADataset(config)
 
     train(
         config=config,
+        dataset=
         
