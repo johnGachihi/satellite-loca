@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Union, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -6,8 +6,6 @@ import torchvision.transforms.functional as TF
 import torchvision
 from PIL import Image
 
-MEAN_RGB = [0.485, 0.456, 0.406]
-STDDEV_RGB = [0.229, 0.224, 0.225]
 
 def init_patch_matching_tracker(size: int = 14):
     """Initialize square grid to track patches correspondances in a mask."""
@@ -106,7 +104,7 @@ class ValueRange:
         clip_values: Whether to clip the output values to the provided ranges.
     """
 
-    def __init__(self, vmin: float, vmax: float, in_min: float = 0, in_max: float= 255, clip_values: bool = True):
+    def __init__(self, vmin: float, vmax: float, in_min: float = 0, in_max: float = 255, clip_values: bool = True):
         self.vmin = vmin
         self.vmax = vmax
         self.in_min = in_min
@@ -248,8 +246,54 @@ class RandomFlipWithMask:
         return image, mask
 
 
+class RandomColorJitter:
+    def __init__(
+            self,
+            p: float = 1.0,
+            brightness: float = 0.4,
+            contrast: float = 0.4,
+            saturation: float = 0.2,
+            hue: float = 0.1
+    ):
+        self.p = p
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+
+    def __call__(self, image: torch.Tensor):
+        if torch.rand((1,)).item() < self.p:
+            return torchvision.transforms.ColorJitter(
+                brightness=self.brightness,
+                contrast=self.contrast,
+                saturation=self.saturation,
+                hue=self.hue
+            )(image)
+        else:
+            return image
+
+
+class RandomGaussianBlur:
+    def __init__(
+            self,
+            p: float = 1.0,
+            kernel_size: int = 224 // 10 - 1,
+            sigma: Sequence[float] = (0.1, 2.0)
+    ):
+        self.p = p
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+
+    def __call__(self, image: torch.Tensor):
+        if torch.rand((1,)).item() < self.p:
+            return torchvision.transforms.GaussianBlur(kernel_size=self.kernel_size)(image)
+        else:
+            return image
+
+
 def image_loader():
     """Load image from path."""
+
     def _image_loader(image_path):
         image = Image.open(image_path)
         image = TF.to_tensor(image)
@@ -261,16 +305,17 @@ def image_loader():
 class LOCATransform:
     """Transform pipeline for LOCA"""
 
+    MEAN_RGB = [0.485, 0.456, 0.406]
+    STDDEV_RGB = [0.229, 0.224, 0.225]
+
     def __init__(
             self,
-            image_loader: Callable[[str], torch.Tensor],
             reference_size: int = 224,
             ref_mask_size: int = 14,
             n_queries: int = 10,
             query_size: int = 96,
             query_mask_size: int = 6,
     ):
-        self.image_loader = image_loader
         self.mask_size = ref_mask_size
         self.n_queries = n_queries
 
@@ -293,23 +338,55 @@ class LOCATransform:
             resize_mask=(query_mask_size, query_mask_size),
         )
 
-    def __call__(self, image_path: str):
-        img = self.image_loader(image_path)
-
+    def __call__(self, img: torch.Tensor):
+        # Create and augment reference
         mask = init_patch_matching_tracker(size=self.mask_size)
         ref, ref_mask, ref_box = self.ref_crop_and_mask(img, mask)
         ref = ValueRange(0, 1)(ref)
-        if torch.rand((1,)).item() > 0.8:  # To align with original
-            ref = torchvision.transforms.ColorJitter(
-                brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1
-            )(ref)
+        ref = RandomColorJitter(p=0.8, brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)(ref)
         ref = torchvision.transforms.RandomGrayscale(p=0.2)(ref)
-        ref = torchvision.transforms.GaussianBlur(kernel_size=224 // 10)(ref)
-        ref = torchvision.transforms.Normalize(mean=MEAN_RGB, std=STDDEV_RGB)(ref)
+        ref = RandomGaussianBlur(p=1.0)(ref)
+        ref = torchvision.transforms.Normalize(
+            mean=LOCATransform.MEAN_RGB,
+            std=LOCATransform.STDDEV_RGB
+        )(ref)
 
-        query0, query0_mask, query0_box, _ = self.query0_crop_and_mask(img, ref_mask, ref_box)
+        # Create and augment queries
+        # Query 0 is distinct from other queries
+        queries: list = [self.query0_crop_and_mask(img, ref_mask, ref_box)]
 
-        queries = [(self.query_crop_and_mask(img, ref_mask, ref_box)) for _ in range(1, self.n_queries)]
+        # Create other queries: [1, n_queries)
+        for i in range(1, self.n_queries):
+            queries.append(self.query_crop_and_mask(img, ref_mask, ref_box))
 
+        # Augmentation for all queries
+        for i in range(self.n_queries):
+            query, q_mask, q_rel_box, q_box = queries[i]
+            query, q_mask = RandomFlipWithMask()(query, q_mask)
+            query = ValueRange(0, 1)(query)
+            query = RandomColorJitter(p=0.8, brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)(query)
+            query = torchvision.transforms.RandomGrayscale(p=0.2)(query)
+            queries[i] = (query, q_mask, q_rel_box, q_box)
 
+        # Augmentation for queries [1, n_queries)
+        for i in range(1, self.n_queries):
+            query, q_mask, q_rel_box, q_box = queries[i]
+            query = RandomGaussianBlur(p=0.5)(query)
+            queries[i] = (query, q_mask, q_rel_box, q_box)
 
+        # Augmentation for query 0
+        query0, q_mask0, q_rel_box, q_box0 = queries[0]
+        query0 = RandomGaussianBlur(p=0.1)(query0)
+        query0 = torchvision.transforms.RandomSolarize(0.2)(query0)
+        queries[0] = (query0, q_mask0, q_rel_box, q_box0)
+
+        # Augmentation for all queries again
+        for i in range(self.n_queries):
+            query, q_mask, q_rel_box, q_box = queries[i]
+            query = torchvision.transforms.Normalize(
+                mean=LOCATransform.MEAN_RGB,
+                std=LOCATransform.STDDEV_RGB
+            )(query)
+            queries[i] = (query, q_mask, q_rel_box, q_box)
+
+        return ref, ref_mask, ref_box, queries
