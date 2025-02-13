@@ -166,7 +166,7 @@ class ToTokenSequence(nn.Module):
         self.patches = patches
         self.hidden_size = hidden_size
         self.posembs = posembs
-        self.positional_embeddings = positional_embedding
+        self.positional_embedding = positional_embedding
 
         self.embedding = nn.Conv2d(
             in_channels=3,  # TODO: Revisit
@@ -233,7 +233,7 @@ class ToTokenSequence(nn.Module):
         x = self.embedding(x).permute(0, 2, 3, 1)
 
         # Add positional encodings
-        x = self.add_positional_encodings(x, positional_embedding)
+        x = self.add_positional_embedding(x, positional_embedding)
 
         # Possibly drop some tokens
         idx_kept_tokens = None
@@ -295,6 +295,7 @@ class ViT4LOCA(nn.Module):
         self.n_ref_positions = n_ref_positions
         self.apply_cluster_loss = apply_cluster_loss
         self.posembs = posembs
+        self.head_output_dim = head_output_dim
 
         # Patchifier and patch tokenizer
         self.to_token = ToTokenSequence(
@@ -304,7 +305,7 @@ class ViT4LOCA(nn.Module):
         )
 
         # ViT Encoder
-        self.encoder_block = nn.ModuleList([
+        self.encoder_blocks = nn.ModuleList([
             Block(
                 dim=hidden_size, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 qkv_bias=True, drop_path=stochastic_depth * (i / max(num_layers - 1, 1))
@@ -316,6 +317,7 @@ class ViT4LOCA(nn.Module):
         # Optional cluster prediction head
         if apply_cluster_loss:
             self.projection_head = ProjectionHead(
+                in_dim=hidden_size,
                 hidden_dim=head_hidden_dim,
                 bottleneck_dim=head_bottleneck_dim,
                 output_dim=head_output_dim
@@ -365,15 +367,15 @@ class ViT4LOCA(nn.Module):
 
         # Process through transformer encoder blocks
         for encoder in self.encoder_blocks:
-            x = encoder(x, train)
+            x = encoder(x)
         x = self.encoder_norm(x)
 
         # Generate clustering predictions if requested
         cluster_pred_outputs = None
         if self.apply_cluster_loss:  # TODO. Interesting! What's happening here?
             cluster_pred_outputs = self.projection_head(x, train)
-            cluster_pred_outputs = cluster_pred_outputs.reshape(-1,
-                                                                self.head_output_dim)
+            cluster_pred_outputs = cluster_pred_outputs.reshape(
+                -1, self.head_output_dim)
 
         # Store patch representations before potential token dropping
         patches_repr = x
@@ -382,7 +384,7 @@ class ViT4LOCA(nn.Module):
         if drop_moment == 'late':
             idx_kept_tokens = token_indexes_not_to_drop(
                 seqlen, self.n_ref_positions, seqlen_selection,
-                device=self.embedding.weight.device)
+                device=x.device)
             if len(idx_kept_tokens) < self.n_ref_positions:
                 patches_repr = torch.index_select(patches_repr, 1, idx_kept_tokens)
 
@@ -411,6 +413,7 @@ class ProjectionHead(nn.Module):
 
     def __init__(
             self,
+            in_dim: int,
             hidden_dim: int = 2048,
             bottleneck_dim: int = 256,
             output_dim: int = 4096,
@@ -419,11 +422,12 @@ class ProjectionHead(nn.Module):
         super().__init__()
 
         # Create MLP layers
+        self.first_layer = nn.Linear(in_dim, hidden_dim)
         self.mlp_layers = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU()
-            ) for _ in range(n_layers)
+            ) for _ in range(1, n_layers)
         ])
 
         # Bottleneck layer
@@ -443,8 +447,9 @@ class ProjectionHead(nn.Module):
             Output tensor after projection
         """
         # Apply MLP layers with residual connections
+        x = self.first_layer(x)
         for layer in self.mlp_layers:
-            x = x + layer(x)  # Residual connection around GELU
+            x = layer(x)  # Residual connection around GELU
 
         # Bottleneck
         x = self.bottleneck(x)

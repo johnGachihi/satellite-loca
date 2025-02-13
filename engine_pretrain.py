@@ -103,14 +103,15 @@ def train_epoch(
 
         # Calculate losses
         q_r_intersect = q_loc_targets != -1
-        q_loc_targets = F.one_hot(q_loc_targets.long(), n_pos)
+        q_loc_targets = F.one_hot(q_loc_targets[q_r_intersect], n_pos).float()
         
         localization_loss = F.cross_entropy(
             q_loc_pred[q_r_intersect],
-            q_loc_targets[q_r_intersect],
+            q_loc_targets,
             reduction='mean'
         )
 
+        # Step 4): Patch cluster prediction loss.
         feature_loss = torch.tensor(0.0, device=device)
         if config.apply_cluster_loss:
             # Feature prediction loss
@@ -121,14 +122,16 @@ def train_epoch(
 
             # Process feature targets
             r_feat_targets = F.softmax(r_feat_targets / config.sharpening, dim=-1)
+            # We adjust the targets with Optimal Transport to prevent collapse.
             r_feat_targets = utils.sinkhorn(r_feat_targets)
+            # [(bs*N), k] -> [bs, N, k]
             r_feat_targets = r_feat_targets.reshape(bs, -1, k)
 
-            # Get targets for queries
+            # Feature targets for the random query.
             q_rand_feat_targets = torch.gather(
                 r_feat_targets,
                 1,
-                q_rand_loc_targets.unsqueeze(-1).expand(-1, -1, k)
+                q_rand_loc_targets[q_rand_loc_targets != -1].unsqueeze(-1).expand(-1, -1, k)
             ).reshape(-1, k)
 
             r_feat_targets = r_feat_targets.repeat(n_q_foc, 1, 1)

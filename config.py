@@ -80,6 +80,8 @@ def get_config() -> ml_collections.ConfigDict:
     config.model.patches = ml_collections.ConfigDict()
     config.model.patches.size = [patch, patch]
     config.model.num_heads = {'Ti': 3, 'S': 6, 'B': 12, 'L': 16, 'H': 16}[version]
+    config.model.mlp_ratio = 4
+    """@deprecated"""
     config.model.mlp_dim = {'Ti': 768,
                             'S': 1536,
                             'B': 3072,
@@ -108,7 +110,7 @@ def get_config() -> ml_collections.ConfigDict:
     # Training.
     config.max_grad_norm = 1
     config.num_training_epochs = 100
-    config.batch_size = 1024
+    config.batch_size = 8
     steps_per_epoch = _IMAGENET_TRAIN_SIZE // config.batch_size
     config.rng_seed = 42
     total_steps = config.num_training_epochs * steps_per_epoch
@@ -138,5 +140,8 @@ def get_config() -> ml_collections.ConfigDict:
     config.checkpoint = True  # Do checkpointing.
     config.checkpoint_steps = 5000
     config.log_summary_steps = 1000
+
+    # Temp
+    config.learning_rate = 0.001
 
     return config

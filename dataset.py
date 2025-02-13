@@ -390,3 +390,50 @@ class LOCATransform:
             queries[i] = (query, q_mask, q_rel_box, q_box)
 
         return ref, ref_mask, ref_box, queries
+
+
+def load_img(image_path: str) -> torch.Tensor:
+    image = Image.open(image_path)
+    image = TF.to_tensor(image)
+    return image
+
+
+class LOCADataset(torch.utils.data.Dataset):
+    """Dataset for LOCA"""
+
+    def __init__(self):
+        self.imagenet_ds = torchvision.datasets.ImageNet(
+            root='/home/ubuntu/data/ImageNet',
+            split='val',
+        )
+        self.loca_transform = LOCATransform()
+
+    def __len__(self):
+        return len(self.imagenet_ds)
+
+    def __getitem__(self, idx):
+        sample, _ = self.imagenet_ds[idx]
+        sample = TF.to_tensor(sample)
+
+        ref, ref_mask, ref_box, queries = self.loca_transform(sample)
+        # queries item -> (query, q_mask, q_rel_box, q_box)
+
+        return {
+            "reference": ref,
+            "query0": queries[0][0],
+            "query0_target_position": queries[0][1],
+            "queries": torch.stack([q[0] for q in queries[1:]]),  # [n_foc_q, C, H, W],
+            "target_positions": torch.stack([q[1] for q in queries[1:]])  # [n_foc_q, H, W]
+        }
+
+    @staticmethod
+    def collate_fn(batch):
+        batch = torch.utils.data.dataloader.default_collate(batch)
+
+        return {
+            "reference": batch["reference"],
+            "query0": batch["query0"],
+            "query0_target_position": batch["query0_target_position"],
+            "queries": batch["queries"].reshape(-1, *batch["queries"].shape[2:]),  # [n_foc_q, B, C, H, W] -> [n_foc_q * B, C, H, W]
+            "target_positions": batch["target_positions"].flatten(0, 1).flatten(1, -1)  # [n_foc_q, B, H, W] -> [n_foc_q * B, H * W]
+        }

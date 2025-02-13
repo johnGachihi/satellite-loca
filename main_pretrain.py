@@ -6,8 +6,11 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from dataset import LOCADataset
 from engine_pretrain import train_epoch
 from config import get_config
+from utils import MockWriter
 from vit import create_ViTLOCAModel
 import copy
 
@@ -21,6 +24,14 @@ def train(
 )  -> Tuple[nn.Module, nn.Module, Any]:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+
+    # Temp dataloader
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=dataset.collate_fn,
+    )
 
     # Initialize models
     model = model.to(device)
@@ -56,15 +67,15 @@ def train(
             global_step = checkpoint['global_step']
 
     # Training loop
-    total_steps = len(dataset.train_loader) * config.num_epochs
+    total_steps = len(dataset) * config.num_training_epochs
     all_metrics = []
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(config.num_training_epochs):
         global_step, epoch_metrics = train_epoch(
             model=model,
             ema_model=ema_model,
             optimizer=optimizer,
-            data_loader=dataset.train_loader,
+            data_loader=dataloader,
             config=config,
             writer=writer,
             device=device,
@@ -91,9 +102,13 @@ if __name__ == '__main__':
     config = get_config()
 
     model = create_ViTLOCAModel(config)
-    dataset = LOCADataset(config)
+    dataset = LOCADataset()
 
     train(
         config=config,
-        dataset=
+        dataset=dataset,
+        model=model,
+        workdir="./output",
+        writer=MockWriter(),
+    )
         

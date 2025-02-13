@@ -30,3 +30,17 @@ def sinkhorn(x: torch.Tensor, num_itr: int = 3, distributed: bool = True) -> tor
         x = x / (weight_per_sample + 1e-8)
     
     return x
+
+
+class MockWriter:
+    def __init__(self):
+        pass
+
+    def add_scalar(self, name, value, step):
+        pass
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
